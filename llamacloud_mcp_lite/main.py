@@ -29,6 +29,7 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import Tool as MCPTool
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -334,10 +335,19 @@ def _build_mcp(
     org_id: Optional[str],
     top_k: int,
     stateless: bool = False,
+    remote: bool = False,
 ) -> FastMCP:
     """Build a FastMCP instance with the given indexes registered as tools."""
     cls = ScopedFastMCP if stateless else FastMCP
-    server = cls("llamacloud-lite", stateless_http=stateless)
+    kwargs: dict[str, Any] = {"stateless_http": stateless}
+    if remote:
+        # Disable DNS rebinding protection for remote deployments (e.g. Render).
+        # Without this, the MCP SDK rejects any Host header that isn't localhost.
+        kwargs["host"] = "0.0.0.0"
+        kwargs["transport_security"] = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+    server = cls("llamacloud-lite", **kwargs)
     for name, description in index_info:
         tool_func = make_index_tool(name, api_key, project_id, org_id, top_k)
         server.tool(name=f"query_{name}", description=description)(tool_func)
@@ -372,7 +382,7 @@ def _build_scoped_http_app(
     for name, description in all_indexes.items():
         server = _build_mcp(
             [(name, description)], api_key, project_id, org_id, top_k,
-            stateless=True,
+            stateless=True, remote=True,
         )
         per_index_servers.append(server)
         per_index_app: ASGIApp = server.streamable_http_app()
@@ -383,7 +393,8 @@ def _build_scoped_http_app(
     # --- Combined MCP server with all indexes (query-param scoping) ---
     index_info = list(all_indexes.items())
     combined_server = _build_mcp(
-        index_info, api_key, project_id, org_id, top_k, stateless=True
+        index_info, api_key, project_id, org_id, top_k,
+        stateless=True, remote=True,
     )
     per_index_servers.append(combined_server)
     combined_app: ASGIApp = combined_server.streamable_http_app()
