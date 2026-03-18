@@ -69,7 +69,27 @@ docker run -p 8000:8000 llamacloud-mcp-lite \
 }
 ```
 
+## Per-Client Index Scoping
+
+When deployed with `--transport streamable-http`, you can restrict which indexes a client can access by adding `?indexes=` to the URL. The server is configured with all indexes at startup, but each client only sees the ones in their query param.
+
+```json
+{
+  "mcpServers": {
+    "llamacloud": {
+      "url": "https://your-server.railway.app/mcp?indexes=neca-manual,pricing-data",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+- `/mcp?indexes=foo,bar` — client only sees `query_foo` and `query_bar` tools
+- `/mcp?indexes=foo` — client only sees `query_foo`
+- `/mcp` — client sees all configured indexes (no filtering)
+
+Unknown index names return a 400 error.
+
 ## License
 
 MIT
-# llamacloud-mcp-lite

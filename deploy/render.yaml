@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: llamacloud-mcp-lite
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /
+    dockerCommand: >-
+      llamacloud-mcp-lite
+      --transport streamable-http
+      --port $PORT
+      --api-key $LLAMA_CLOUD_API_KEY
+      --org-id $LLAMA_CLOUD_ORG_ID
+      --project-id $LLAMA_CLOUD_PROJECT_ID
+      --x-api-key $X_API_KEY
+      --index "$INDEX_1"
+      --index "$INDEX_2"
+      --index "$INDEX_3"
+    envVars:
+      - key: LLAMA_CLOUD_API_KEY
+        sync: false
+      - key: LLAMA_CLOUD_ORG_ID
+        sync: false
+      - key: LLAMA_CLOUD_PROJECT_ID
+        sync: false
+      - key: X_API_KEY
+        sync: false
+      - key: INDEX_1
+        sync: false
+      - key: INDEX_2
+        sync: false
+      - key: INDEX_3
+        sync: false
