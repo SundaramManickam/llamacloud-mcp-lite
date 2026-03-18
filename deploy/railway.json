@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "deploy/Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "startCommand": "llamacloud-mcp-lite --transport streamable-http --port $PORT --api-key $LLAMA_CLOUD_API_KEY --org-id $LLAMA_CLOUD_ORG_ID --project-id $LLAMA_CLOUD_PROJECT_ID --index \"$INDEX_1\" --index \"$INDEX_2\" --index \"$INDEX_3\"",
+    "healthcheckPath": "/",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
