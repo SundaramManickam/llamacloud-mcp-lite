@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 LLAMACLOUD_API_BASE = "https://api.cloud.llamaindex.ai/api/v1"
 
-mcp = FastMCP("llamacloud-lite")
-
 
 async def _get_pipeline_id(
     client: httpx.AsyncClient,
@@ -36,7 +34,6 @@ async def _get_pipeline_id(
     if org_id:
         params["organization_id"] = org_id
 
-    # List pipelines and find the one matching our index name
     resp = await client.get(f"{LLAMACLOUD_API_BASE}/pipelines", params=params)
     resp.raise_for_status()
     pipelines = resp.json()
@@ -81,7 +78,6 @@ def make_index_tool(
 ) -> Callable[[Context, str], Awaitable[str]]:
     """Create a tool function that queries a specific LlamaCloud index."""
 
-    # Cache the pipeline ID after first lookup
     _pipeline_id_cache: dict[str, str] = {}
 
     async def tool(ctx: Context, query: str) -> str:
@@ -96,26 +92,20 @@ def make_index_tool(
             }
 
             async with httpx.AsyncClient(headers=headers) as client:
-                # Resolve pipeline ID (cached after first call)
                 if index_name not in _pipeline_id_cache:
                     pid = await _get_pipeline_id(client, index_name, project_id, org_id)
                     _pipeline_id_cache[index_name] = pid
 
                 pipeline_id = _pipeline_id_cache[index_name]
-
-                # Run the retrieval
                 results = await _retrieve(client, pipeline_id, query, top_k)
 
-            # Format results for the LLM
             if not results:
                 return f"No results found for query: {query}"
 
-            # Handle both list-of-nodes and dict response formats
             nodes = results if isinstance(results, list) else results.get("retrieval_nodes", results.get("nodes", []))
 
             formatted = []
             for i, node in enumerate(nodes, 1):
-                # Handle different response structures
                 if isinstance(node, dict):
                     text = node.get("text", node.get("node", {}).get("text", ""))
                     score = node.get("score", node.get("similarity", "N/A"))
@@ -214,6 +204,9 @@ def main(
             "API key required. Use --api-key or set LLAMA_CLOUD_API_KEY env var."
         )
 
+    # Create the MCP server with host/port for HTTP transports
+    mcp = FastMCP("llamacloud-lite", host=host, port=port)
+
     # Parse indexes
     index_info = []
     if indexes:
@@ -234,12 +227,7 @@ def main(
         mcp.tool(name=f"query_{name}", description=description)(tool_func)
 
     # Run the server
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    elif transport == "sse":
-        mcp.run(transport="sse")
-    elif transport == "streamable-http":
-        mcp.run(transport="streamable-http", host=host, port=port)
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
