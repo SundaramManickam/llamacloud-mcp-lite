@@ -6,22 +6,31 @@ without the heavy llama-index-core / llama-cloud SDK dependencies.
 
 This makes uvx startup near-instant (3 deps vs 50+).
 
-Supports per-client index scoping and auth via query params on HTTP transports:
-  /mcp?indexes=foo,bar&x-api-key=SECRET  -> authed, only sees foo and bar
-  /mcp?x-api-key=SECRET                  -> authed, sees all indexes
-  /mcp                                   -> rejected if server has x-api-key set
+Supports two modes for per-connector index isolation:
+
+1. Path-based routing (recommended for Claude connectors):
+     /indexes/Material-pricing-all/mcp  -> only sees Material-pricing-all
+     /indexes/Inventory/mcp             -> only sees Inventory
+     /mcp                               -> sees all indexes
+
+2. Query-param scoping (for clients that support query params):
+     /mcp?indexes=foo,bar&x-api-key=SECRET
 """
 
 import click
+import contextlib
 import contextvars
 import os
 import logging
+from contextlib import AsyncExitStack
 from urllib.parse import parse_qs
 
 import httpx
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import Tool as MCPTool
+from starlette.applications import Starlette
+from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
@@ -36,6 +45,45 @@ _pipeline_id_cache: dict[str, str] = {}
 _allowed_tools_var: contextvars.ContextVar[Optional[set[str]]] = contextvars.ContextVar(
     "_allowed_tools_var", default=None
 )
+
+def _fetch_all_indexes(
+    api_key: str,
+    project_id: Optional[str] = None,
+    org_id: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """
+    Fetch all indexes (pipelines) from the LlamaCloud API synchronously at startup.
+    Returns a list of (name, description) tuples.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    params: dict[str, str] = {}
+    if project_id:
+        params["project_id"] = project_id
+    if org_id:
+        params["organization_id"] = org_id
+
+    with httpx.Client(headers=headers) as client:
+        resp = client.get(f"{LLAMACLOUD_API_BASE}/pipelines", params=params)
+        resp.raise_for_status()
+        pipelines = resp.json()
+
+    results = []
+    for p in pipelines:
+        name = p.get("name", "")
+        if not name:
+            continue
+        # Use the pipeline's description if available, otherwise generate one
+        desc = p.get("description") or f"Query the '{name}' index"
+        # Cache the pipeline ID while we're at it
+        if p.get("id"):
+            _pipeline_id_cache[name] = p["id"]
+        results.append((name, desc))
+
+    return results
+
 
 async def _get_pipeline_id(
     client: httpx.AsyncClient,
@@ -305,22 +353,53 @@ def _build_scoped_http_app(
     x_api_key: Optional[str] = None,
 ) -> ASGIApp:
     """
-    Build a Starlette app with all tools registered, wrapped in
-    auth + index scoping middleware.
+    Build a Starlette app with:
 
-    Middleware order (outermost first):
+    1. Per-index path-based routes (for Claude connectors):
+         /indexes/<index-name>/mcp  -> isolated MCP server with only that index
+
+    2. Combined route with query-param scoping (backward compat):
+         /mcp                       -> all indexes (filterable via ?indexes=)
+
+    Middleware order on the combined route (outermost first):
       ApiKeyAuthMiddleware  -> checks ?x-api-key=
       IndexScopingMiddleware -> filters tools by ?indexes=
       MCP Starlette app     -> handles the actual MCP protocol
     """
+    # --- Per-index MCP servers for path-based routing ---
+    per_index_servers: list[FastMCP] = []
+    routes = []
+    for name, description in all_indexes.items():
+        server = _build_mcp(
+            [(name, description)], api_key, project_id, org_id, top_k,
+            stateless=True,
+        )
+        per_index_servers.append(server)
+        per_index_app: ASGIApp = server.streamable_http_app()
+        if x_api_key:
+            per_index_app = ApiKeyAuthMiddleware(per_index_app, x_api_key)
+        routes.append(Mount(f"/indexes/{name}", app=per_index_app))
+
+    # --- Combined MCP server with all indexes (query-param scoping) ---
     index_info = list(all_indexes.items())
-    server = _build_mcp(
+    combined_server = _build_mcp(
         index_info, api_key, project_id, org_id, top_k, stateless=True
     )
-    mcp_app = server.streamable_http_app()
-    app: ASGIApp = IndexScopingMiddleware(mcp_app, set(all_indexes.keys()))
-    app = ApiKeyAuthMiddleware(app, x_api_key)
-    return app
+    per_index_servers.append(combined_server)
+    combined_app: ASGIApp = combined_server.streamable_http_app()
+    combined_app = IndexScopingMiddleware(combined_app, set(all_indexes.keys()))
+    combined_app = ApiKeyAuthMiddleware(combined_app, x_api_key)
+    routes.append(Mount("/", app=combined_app))
+
+    # --- Combined lifespan to initialize all session managers ---
+    @contextlib.asynccontextmanager
+    async def combined_lifespan(app):
+        async with AsyncExitStack() as stack:
+            for srv in per_index_servers:
+                await stack.enter_async_context(srv.session_manager.run())
+            yield
+
+    return Starlette(routes=routes, lifespan=combined_lifespan)
 
 
 @click.command()
@@ -330,7 +409,7 @@ def _build_scoped_http_app(
     multiple=True,
     required=False,
     type=str,
-    help="Index definition in format name:description. Can be repeated.",
+    help="Index definition in format name:description. Can be repeated. If omitted, all indexes are auto-discovered from the LlamaCloud API.",
 )
 @click.option(
     "--project-id",
@@ -401,8 +480,10 @@ def main(
         )
 
     x_api_key = x_api_key or os.getenv("X_API_KEY")
+    project_id = project_id or os.getenv("LLAMA_CLOUD_PROJECT_ID")
+    org_id = org_id or os.getenv("LLAMA_CLOUD_ORG_ID")
 
-    index_info = []
+    index_info: list[tuple[str, str]] = []
     if indexes:
         for idx in indexes:
             if ":" not in idx:
@@ -413,7 +494,15 @@ def main(
             index_info.append((name.strip(), description.strip()))
 
     if not index_info:
-        raise click.BadParameter("At least one --index is required.")
+        # Auto-discover all indexes from the LlamaCloud API
+        logger.info("No --index flags provided, auto-discovering from LlamaCloud API...")
+        index_info = _fetch_all_indexes(api_key, project_id, org_id)
+        if not index_info:
+            raise click.BadParameter(
+                "No indexes found via LlamaCloud API. "
+                "Provide --index flags or check your API key / project-id / org-id."
+            )
+        logger.info(f"Discovered {len(index_info)} indexes: {[n for n, _ in index_info]}")
 
     if transport == "streamable-http":
         all_indexes = {name: desc for name, desc in index_info}
